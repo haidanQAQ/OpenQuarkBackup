@@ -39,7 +39,7 @@ from .cron import CronSyntaxError
 from .job import BackupJob
 from .openlist_api import OpenListClient, OpenListError, redact
 from .prune import human_size
-from .prune import RemoteEntry, decide_prune, is_valid_backup_name
+from .prune import RemoteEntry, decide_prune, sort_newest_first
 from .scheduler import CronScheduler
 
 #: 命令都要求 MCDR 管理员（admin, 权限 3）或更高。
@@ -60,9 +60,11 @@ class OpenQuarkBackupPlugin:
     def load(self) -> None:
         try:
             self._reload(initial=True)
-        except Exception:
-            self.logger.exception('OpenQuarkBackup 初始化失败，插件将保持未启用状态')
-            return
+        except Exception as e:
+            # 初始化失败（多半是 config.json 写坏了）也必须把命令注册上：
+            # 运维修好配置文件后能直接 ``!!oqb reload`` 恢复，而不用去控制台重载整个插件。
+            self.logger.exception('OpenQuarkBackup 初始化失败，插件处于未启用状态：{}'.format(e))
+            self.logger.warning('修正 config.json 后执行 !!oqb reload 即可恢复，无需重载插件')
         self._register_commands()
         self.server.register_help_message('!!oqb', 'OpenQuarkBackup 备份管理', permission=MANAGE_LEVEL)
 
@@ -87,6 +89,8 @@ class OpenQuarkBackupPlugin:
                 resolved.cron_error))
         if resolved.tz_error:
             self.logger.warning(resolved.tz_error)
+        if resolved.prefix_warning:
+            self.logger.warning(resolved.prefix_warning)
 
         # 保留同一个 BackupJob：它身上挂着互斥锁、取消信号和上次运行结果。
         # 如果 reload 时重建实例，正在跑的那次任务就失去了锁保护（定时触发可能并发挤进来），
@@ -210,8 +214,13 @@ class OpenQuarkBackupPlugin:
             source.reply(RText('  上次结束: {}'.format(
                 summary['finished_at'].strftime('%Y-%m-%d %H:%M:%S %z')), RColor.gray))
         if summary['last_name']:
-            source.reply(RText('  上次文件: {}（{}，耗时 {:.1f} 秒）'.format(
-                summary['last_name'], human_size(summary['last_size']), summary['last_duration']), RColor.gray))
+            if job.is_running():
+                # 运行中只报"本次文件"，不拿上次的体积/耗时/成功状态来拼
+                source.reply(RText('  本次文件: {}（阶段 {}）'.format(
+                    summary['last_name'], summary['phase']), RColor.gray))
+            else:
+                source.reply(RText('  上次文件: {}（{}，耗时 {:.1f} 秒）'.format(
+                    summary['last_name'], human_size(summary['last_size']), summary['last_duration']), RColor.gray))
         if summary['last_ok'] is True:
             source.reply(RText('  上次结果: 成功', RColor.green))
         elif summary['last_ok'] is False:
@@ -309,20 +318,17 @@ class OpenQuarkBackupPlugin:
                 return
 
             entries = [RemoteEntry.from_openlist(item) for item in items]
-            valid = sorted(
-                (e for e in entries
-                 if not e.is_dir and is_valid_backup_name(e.name, r.filename_prefix)
-                 and e.size > r.min_valid_size_bytes),
-                key=lambda e: e.name,
-                reverse=True,
-            )
+            # 复用清理逻辑做过滤：max_keep=0 表示"只看不删"，valid/suspicious 的判定
+            # 与真正清理时完全一致，不再各写一套，避免两处规则漂移
+            decision = decide_prune(entries, r.filename_prefix, max_keep=0,
+                                    min_valid_size_bytes=r.min_valid_size_bytes)
+            valid = sort_newest_first(decision.valid)
             if not valid:
                 source.reply(RText('远端目录 {} 里没有有效备份包'.format(r.remote_dir), RColor.yellow))
             else:
                 source.reply(RText('===== 远端备份（{} 份）====='.format(len(valid)), RColor.aqua))
                 for entry in valid:
                     source.reply(RText('  {}  {}'.format(entry.name, human_size(entry.size)), RColor.gray))
-            decision = decide_prune(entries, r.filename_prefix, r.max_keep, r.min_valid_size_bytes)
             for entry in decision.suspicious:
                 source.reply(RText('  注意: {} 体积仅 {} 字节，疑似异常文件'.format(entry.name, entry.size),
                                    RColor.yellow))

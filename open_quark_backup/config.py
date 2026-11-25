@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import os
@@ -28,6 +29,9 @@ ENV_OPENLIST_TOKEN = 'OQB_OPENLIST_TOKEN'
 
 #: 探测 PB 数据库时优先尝试的文件名（新版 PB 是 prime_backup.db）。
 DB_CANDIDATE_NAMES = ('prime_backup.db', 'pbmeta.db')
+
+#: ``filename_prefix`` 非法时回退到的默认值。
+DEFAULT_FILENAME_PREFIX = 'pb_backup_'
 
 #: PrimeBackup 自己的配置文件相对路径（相对 MCDR 根目录）。
 PB_CONFIG_RELATIVE = os.path.join('config', 'prime_backup', 'config.json')
@@ -108,6 +112,8 @@ class ResolvedConfig:
     timeout_sec: int
     retry_times: int
     min_free_space_ratio: float
+    #: ``filename_prefix`` 非法时的告警（已自动回退默认值），供上层打日志
+    prefix_warning: Optional[str] = None
 
     def next_fire_times(self, now, count: int = 3):
         if self.cron_spec is None:
@@ -267,16 +273,67 @@ def ensure_config_file(server, logger) -> str:
 def load_config(server, logger) -> tuple:
     """生成（如缺失）、读取并解析配置，返回 (raw_config, resolved)。"""
     ensure_config_file(server, logger)
-    cfg = server.load_config_simple(
-        file_name='config.json',
-        target_class=Config,
-        encoding='utf-8-sig',  # 兼容 Windows 记事本写出的 BOM
-        failure_policy='raise',
-    )
+    cfg = server.load_config_simple(**_load_config_kwargs(server))
     if not isinstance(cfg, Config):
         raise RuntimeError('配置文件解析结果不是 Config 实例')
     resolved = resolve_config(cfg, server)
     return cfg, resolved
+
+
+def _accepted_params(func):
+    """
+    反射出 ``load_config_simple`` 支持的参数。
+
+    MCDR 2.12 才加入 ``failure_policy``，更早的版本没有；直接用会让插件在声明支持的
+    ``>=2.0.0`` 区间里 ImportError/TypeError。这里按签名过滤，老的用默认 regen 行为、
+    新的用 raise（配置写坏时明确报错，而不是被默默覆盖成默认值）。
+    """
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return None, True
+    names = set()
+    for name, param in params.items():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return names, True
+        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+            names.add(name)
+    return names, False
+
+
+def _load_config_kwargs(server) -> dict:
+    names, any_keyword = _accepted_params(server.load_config_simple)
+
+    def accepts(name: str) -> bool:
+        return names is None or any_keyword or name in names
+
+    kwargs = {'file_name': 'config.json', 'target_class': Config}
+    if accepts('encoding'):
+        kwargs['encoding'] = 'utf-8-sig'  # 兼容 Windows 记事本写出的 BOM
+    if accepts('failure_policy'):
+        kwargs['failure_policy'] = 'raise'
+    return kwargs
+
+
+def normalize_filename_prefix(prefix: str):
+    """
+    校验备份包名前缀，返回 ``(前缀, 告警或 None)``。
+
+    前缀会被拼进远端文件名，带 ``/``、``\\`` 就等于把包写进别的目录；以 ``.`` 开头则会
+    变成隐藏文件，和 exFAT/macOS 的 ``._*`` 残留混在一起，清理逻辑也会忽略它。这两种
+    情况都回退到默认值并告警，而不是让任务在半夜里静默生成一个找不到的包。
+    """
+    raw = (prefix or '').strip()
+    if not raw:
+        return DEFAULT_FILENAME_PREFIX, 'filename_prefix 为空，已回退为默认值 {!r}'.format(DEFAULT_FILENAME_PREFIX)
+    if '/' in raw or '\\' in raw:
+        return DEFAULT_FILENAME_PREFIX, \
+            'filename_prefix {!r} 含有路径分隔符，已回退为默认值 {!r}'.format(raw, DEFAULT_FILENAME_PREFIX)
+    if raw.startswith('.'):
+        return DEFAULT_FILENAME_PREFIX, \
+            'filename_prefix {!r} 不能以 . 开头（会与 exFAT/macOS 的 ._* 隐藏文件混淆），已回退为默认值 {!r}'.format(
+                raw, DEFAULT_FILENAME_PREFIX)
+    return raw, None
 
 
 def resolve_config(cfg: Config, server) -> ResolvedConfig:
@@ -331,6 +388,8 @@ def resolve_config(cfg: Config, server) -> ResolvedConfig:
     token = os.environ.get(ENV_OPENLIST_TOKEN, '').strip() or (cfg.openlist_token or '').strip()
     url = os.environ.get(ENV_OPENLIST_URL, '').strip() or cfg.openlist_url
 
+    filename_prefix, prefix_warning = normalize_filename_prefix(cfg.filename_prefix)
+
     return ResolvedConfig(
         raw=cfg,
         mcdr_root=mcdr_root,
@@ -351,13 +410,14 @@ def resolve_config(cfg: Config, server) -> ResolvedConfig:
         openlist_password=password,
         openlist_token=token,
         remote_dir=normalize_remote_dir(cfg.remote_dir),
-        filename_prefix=cfg.filename_prefix or 'pb_backup_',
+        filename_prefix=filename_prefix,
         max_keep=int(cfg.max_keep),
         min_valid_size_bytes=int(cfg.min_valid_size_bytes),
         as_task=bool(cfg.as_task),
         timeout_sec=max(10, int(cfg.timeout_sec)),
         retry_times=max(0, int(cfg.retry_times)),
         min_free_space_ratio=max(1.0, float(cfg.min_free_space_ratio)),
+        prefix_warning=prefix_warning,
     )
 
 

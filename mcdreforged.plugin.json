@@ -1,6 +1,6 @@
 {
 	"id": "open_quark_backup",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"name": "OpenQuarkBackup",
 	"description": {
 		"en_us": "Pack the PrimeBackup repository on a cron schedule and upload it to Quark Drive via OpenList",

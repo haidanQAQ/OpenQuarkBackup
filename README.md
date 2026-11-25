@@ -16,7 +16,7 @@
 
 ## 依赖
 
-- MCDReforged 2.0.0 及以上
+- MCDReforged 2.0.0 及以上（MCDR 2.12 之前没有 `failure_policy` 参数，配置写坏时会被重置成默认值；2.12 及以上会直接报错并保留现场，修好后 `!!oqb reload` 即可）
 - Python 3.9+（用到 `zoneinfo`；Windows 上需要 `pip install tzdata`）
 - 一个能访问的 OpenList，夸克网盘已经挂载好
 - 已启用的 PrimeBackup（本插件读它的仓库目录与数据库）

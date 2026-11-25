@@ -188,6 +188,36 @@ class PackerTest(unittest.TestCase):
         with self.assertRaises(packer.PackError):
             packer.check_free_space(self.temp_dir, 1 << 60, 1.15)
 
+    # ---------------------------------------------------------------- 取消
+    def test_build_tar_cancel_aborts(self):
+        """取消信号必须在写归档的过程中生效，而不是等整个 tar 写完。"""
+        payload = packer.scan_payload(self.pb, self.db)
+        snapshot = os.path.join(self.temp_dir, 'snap.db')
+        packer.snapshot_database(self.db, snapshot)
+        tar_path = os.path.join(self.temp_dir, 'pb_backup_20260101_020000.tar')
+
+        calls = {'n': 0}
+
+        def cancel_check():
+            calls['n'] += 1
+            return calls['n'] >= 3   # 前两次放行，之后取消
+
+        with self.assertRaises(packer.PackError) as ctx:
+            packer.build_tar(tar_path, payload, snapshot, cancel_check=cancel_check)
+        self.assertIn('任务已取消', str(ctx.exception))
+        # 确实是在循环里被拦下的：至少做过一次检查，而且已经写了几个条目
+        self.assertGreaterEqual(calls['n'], 3)
+
+    def test_build_tar_without_cancel_completes(self):
+        """不传 cancel_check 时行为不变（回归保护）。"""
+        payload = packer.scan_payload(self.pb, self.db)
+        snapshot = os.path.join(self.temp_dir, 'snap.db')
+        packer.snapshot_database(self.db, snapshot)
+        tar_path = os.path.join(self.temp_dir, 'pb_backup_20260101_020000.tar')
+        size = packer.build_tar(tar_path, payload, snapshot)
+        self.assertGreater(size, 0)
+        self.assertTrue(os.path.isfile(tar_path))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -215,13 +215,16 @@ def build_tar(
     snapshot_path: str,
     extra_files: Sequence[Tuple[str, str]] = (),
     progress: Optional[Callable[[int, int, str], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> int:
     """
     生成无压缩 tar 包，返回写入的总字节数。
 
     * 快照以原库名（如 ``prime_backup.db``）放在归档根目录，恢复时可直接替换；
     * ``extra_files`` 是 (绝对路径, 归档内路径) 序列，用于附带 PB 配置文件；
-    * ``progress(done_bytes, total_bytes, arcname)`` 会定期被调用，便于打日志。
+    * ``progress(done_bytes, total_bytes, arcname)`` 会定期被调用，便于打日志；
+    * ``cancel_check`` 每个条目写入前调用一次，返回 True 就立刻中止并抛
+      :class:`PackError`（数 GB 的归档写十分钟很常见，不能只能干等）。
     """
     os.makedirs(os.path.dirname(os.path.abspath(tar_path)), exist_ok=True)
     if os.path.exists(tar_path):
@@ -232,6 +235,10 @@ def build_tar(
     last_report = 0.0
     started = time.time()
 
+    def check_cancel() -> None:
+        if cancel_check is not None and cancel_check():
+            raise PackError('任务已取消')
+
     def report(arcname: str, force: bool = False) -> None:
         nonlocal last_report
         now = time.time()
@@ -241,6 +248,7 @@ def build_tar(
 
     def add_file(abs_path: str, arcname: str, size: int) -> None:
         nonlocal done
+        check_cancel()
         try:
             tar.add(abs_path, arcname=arcname, recursive=False)
         except (OSError, tarfile.TarError) as e:
@@ -251,6 +259,7 @@ def build_tar(
     try:
         with tarfile.open(tar_path, mode='w', format=tarfile.PAX_FORMAT) as tar:
             # 1) 数据库快照（放在根目录，名字与原来一致）
+            check_cancel()
             db_size = os.path.getsize(snapshot_path)
             tar.add(snapshot_path, arcname=payload.db_name, recursive=False)
             done += db_size
@@ -264,6 +273,7 @@ def build_tar(
 
             # 3) 数据目录
             for abs_dir, arc in payload.dirs:
+                check_cancel()
                 try:
                     tar.add(abs_dir, arcname=arc, recursive=False)
                 except (OSError, tarfile.TarError):

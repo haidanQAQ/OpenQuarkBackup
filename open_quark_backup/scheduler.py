@@ -93,6 +93,12 @@ class CronScheduler(threading.Thread):
                 if datetime.now(self._tz) < next_fire:
                     continue  # 还没到点，继续等
 
+            # 到了这一行说明"该触发了"：但 delay<=0 的路径不会经过上面的等待段，
+            # 期间可能刚好有 refresh(enabled=False) 或 stop() 插进来。触发前再确认一次，
+            # 否则会出现"已经停用/已经卸载了还跑了一次备份"。
+            if self._stopped.is_set() or self._wake.is_set() or not self._enabled:
+                continue
+
             if self._stopped.is_set():
                 break
             self.next_fire = None

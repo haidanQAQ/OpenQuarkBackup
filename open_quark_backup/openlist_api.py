@@ -54,6 +54,12 @@ TASK_INFO_ROUTES = (
     '/api/admin/task/upload/info',
 )
 
+#: 任务分组前缀的兜底值（在还没探测过任何任务路由时使用）。
+TASK_DEFAULT_BASE = '/api/task/upload'
+
+#: 取消/删除任务这类"收拾残局"请求的超时上限（秒）：不宜沿用上传时的大超时。
+TASK_CLEANUP_TIMEOUT = 15.0
+
 
 class OpenListError(Exception):
     """OpenList 接口调用失败。``status`` 为 HTTP 状态码（网络错误时为 None）。"""
@@ -116,10 +122,12 @@ class OpenListClient:
         self.login()
 
     def _has_credentials(self) -> bool:
-        return bool(self.username or self.password)
+        """能否用账号密码登录：两者都有才行，缺一个去登录只会白跑一趟。"""
+        return bool(self.username and self.password)
 
     def _request_json(self, method: str, path: str, body: Optional[dict] = None,
-                      auth: bool = True, retry_auth: bool = True) -> dict:
+                      auth: bool = True, retry_auth: bool = True,
+                      timeout: Optional[float] = None) -> dict:
         data = None
         if body is not None:
             data = json.dumps(body, ensure_ascii=False).encode('utf-8')
@@ -127,8 +135,10 @@ class OpenListClient:
         if auth and self._ensure_token():
             headers['Authorization'] = self._token
         request = urllib.request.Request(self._url(path), data=data, headers=headers, method=method)
+        # 登录请求自己不能触发"重新登录"：那会变成递归。``auth`` 为 False 的请求同理。
+        can_retry_auth = bool(retry_auth and auth and self._has_credentials())
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout if timeout is not None else self.timeout) as response:
                 raw = response.read()
         except urllib.error.HTTPError as e:
             raw = b''
@@ -136,9 +146,9 @@ class OpenListClient:
                 raw = e.read()
             except Exception:
                 pass
-            if e.code == 401 and retry_auth and self._has_credentials():
+            if e.code == 401 and can_retry_auth:
                 self._relogin('HTTP 401')
-                return self._request_json(method, path, body, auth=auth, retry_auth=False)
+                return self._request_json(method, path, body, auth=auth, retry_auth=False, timeout=timeout)
             message = self._error_message(raw) or 'HTTP {}'.format(e.code)
             raise OpenListError('{} {} 失败: {}'.format(method, path, message), status=e.code) from None
         except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -146,9 +156,9 @@ class OpenListClient:
 
         payload = self._decode(raw)
         # AList/OpenList 在鉴权失效时经常仍返回 HTTP 200，只在 body 里写 code=401
-        if payload.get('code') == 401 and retry_auth and self._has_credentials():
+        if payload.get('code') == 401 and can_retry_auth:
             self._relogin('code=401')
-            return self._request_json(method, path, body, auth=auth, retry_auth=False)
+            return self._request_json(method, path, body, auth=auth, retry_auth=False, timeout=timeout)
         if payload.get('code') not in (200, None):
             raise OpenListError('{} {} 返回错误: {}'.format(method, path, payload.get('message') or payload),
                                 status=payload.get('code'))
@@ -168,12 +178,14 @@ class OpenListClient:
     def login(self, force: bool = False) -> str:
         if self._token and not force:
             return self._token
-        if not (self.username and self.password):
+        if not self._has_credentials():
             raise OpenListError('未配置 openlist_token，也没有 openlist_username/password，无法登录 OpenList')
+        # retry_auth=False：登录接口自己返回 401 时必须直接报错，绝不能再去"重新登录"
         payload = self._request_json(
             'POST', '/api/auth/login',
             {'username': self.username, 'password': self.password},
             auth=False,
+            retry_auth=False,
         )
         data = payload.get('data') or {}
         token = data.get('token') if isinstance(data, dict) else None
@@ -202,19 +214,31 @@ class OpenListClient:
         对已经存在的层级重复 ``mkdir`` 会白打请求、某些驱动还会报错。因此每一级都先
         ``get`` 探测：存在就跳过，不存在才建。挂载点根目录（``/夸克`` 这类）同理，
         已经存在时不会被再次创建。
+
+        每一级探测到的若不是目录（远端有个同名普通文件占着路径），立刻报错——继续
+        ``mkdir`` 只会拿到一个语焉不详的驱动错误，事后上传还会静默失败。
         """
         normalized = (path or '').strip()
         if not normalized or normalized == '/':
             return
-        if self.get(normalized):
+        info = self.get(normalized)
+        if info is not None:
+            self._assert_is_dir(info, normalized)
             return
 
         current = ''
         for part in [p for p in normalized.split('/') if p]:
             current += '/' + part
-            if self.get(current):
+            info = self.get(current)
+            if info is not None:
+                self._assert_is_dir(info, current)
                 continue
             self.mkdir(current)
+
+    @staticmethod
+    def _assert_is_dir(info: dict, path: str) -> None:
+        if not info.get('is_dir'):
+            raise OpenListError('远端路径被同名文件占用，无法作为目录使用: {}'.format(path))
 
     def list_dir(self, path: str, refresh: bool = True) -> List[dict]:
         payload = self._request_json('POST', '/api/fs/list', {
@@ -384,8 +408,10 @@ class OpenListClient:
     def cancel_task(self, task_id: str) -> bool:
         """取消一个上传任务（成功后它会进入已取消，不再占「待处理」）。"""
         try:
-            self._request_json('POST', '/api/task/upload/cancel?tid={}'.format(
-                urllib.parse.quote(str(task_id))), {})
+            # 取消/删除是"收拾残局"的动作，用短超时：真失败也不该把退出流程卡上半小时
+            self._request_json('POST', '{}/cancel?tid={}'.format(
+                self._task_base(), urllib.parse.quote(str(task_id))), {},
+                timeout=min(self.timeout, TASK_CLEANUP_TIMEOUT))
             self._log('info', '已取消残留上传任务 {}'.format(task_id))
             return True
         except OpenListError as e:
@@ -395,12 +421,26 @@ class OpenListClient:
     def delete_task(self, task_id: str) -> bool:
         """把任务记录从 OpenList 的任务列表里删掉。"""
         try:
-            self._request_json('POST', '/api/task/upload/delete?tid={}'.format(
-                urllib.parse.quote(str(task_id))), {})
+            self._request_json('POST', '{}/delete?tid={}'.format(
+                self._task_base(), urllib.parse.quote(str(task_id))), {},
+                timeout=min(self.timeout, TASK_CLEANUP_TIMEOUT))
             return True
         except OpenListError as e:
             self._log('warning', '删除上传任务记录 {} 失败: {}'.format(task_id, e))
             return False
+
+    def _task_base(self) -> str:
+        """
+        任务接口的分组前缀。
+
+        任务路由是按分组挂在 ``/api/task/<group>`` 或 ``/api/admin/task/<group>`` 下的，
+        ``task_info()`` 探测成功后已经把命中的完整路由缓存进 ``self._task_info_route``，
+        取消/删除直接由它推出前缀，避免一边查 ``/api/admin/...`` 一边去取消 ``/api/...``。
+        """
+        route = self._task_info_route or TASK_INFO_ROUTES[0]
+        if route.endswith('/info'):
+            return route[:-len('/info')]
+        return TASK_DEFAULT_BASE
 
     def wait_task(self, task_id: str, timeout: Optional[float] = None,
                   cancel_check: Optional[Callable[[], bool]] = None) -> dict:

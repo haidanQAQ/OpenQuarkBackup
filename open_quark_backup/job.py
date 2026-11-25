@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import posixpath
 import threading
 import time
 from datetime import datetime
@@ -92,7 +93,13 @@ class BackupJob:
         self.phase = PHASE_PACKING
         self.started_at = self._now()
         self.finished_at = None
+        # 新任务开始时把"上次结果"清掉：否则第二次运行期间 ``!!oqb status`` 会把新包名
+        # 和上一次的体积/耗时/成功状态拼在一起显示，看起来像成功了但数字是旧的。
+        self.last_ok = None
         self.last_error = None
+        self.last_size = 0
+        self.last_duration = 0.0
+        self.last_removed = []
         self._thread = threading.Thread(
             target=self._run_guarded,
             name='open_quark_backup-worker',
@@ -158,6 +165,11 @@ class BackupJob:
         uploaded_size = 0
         try:
             self.phase = PHASE_PACKING
+            # 写任何东西之前先看暂存盘够不够：快照本身就要一份数据库大小的空间，
+            # 等到 tar 写一半才发现没地方，磁盘已经被写爆了（外接盘写满还会连累服）。
+            base_needed = os.path.getsize(cfg.db_path) + packer.wal_size(cfg.db_path)
+            packer.check_free_space(cfg.temp_dir, base_needed, cfg.min_free_space_ratio)
+
             self.logger.info('导出 SQLite 一致性快照 …')
             packer.snapshot_database(cfg.db_path, snapshot_path)
             self._check_cancel()
@@ -183,6 +195,9 @@ class BackupJob:
             uploaded_size = packer.build_tar(
                 tar_path, payload, snapshot_path, extra_files=extra,
                 progress=self._on_pack_progress,
+                # 传输取消信号：GB 级归档写十分钟是常事，`!!oqb reload`/插件卸载时
+                # 不能只能干等它写完
+                cancel_check=self._cancel.is_set,
             )
             self.last_size = uploaded_size
             self.logger.info('归档完成: {}（{}）'.format(name, _human(uploaded_size)))
@@ -260,7 +275,10 @@ class BackupJob:
                     client.delete_task(task_id)
                     client.last_task_id = None
                 if attempt < attempts:
-                    time.sleep(min(30.0, 5.0 * attempt))
+                    # 退避期间也要能被取消唤醒：用 Event.wait 而不是 time.sleep，
+                    # 否则卸载插件要等最多 30 秒才退得掉
+                    if self._cancel.wait(min(30.0, 5.0 * attempt)):
+                        raise RuntimeError('任务已取消')
         raise RuntimeError('上传重试 {} 次后仍失败: {}'.format(attempts, last_error))
 
     def _prune(self, client: OpenListClient, just_uploaded: str) -> None:
@@ -292,7 +310,8 @@ class BackupJob:
             return
 
         for entry in decision.to_delete:
-            if entry.name == os.path.basename(just_uploaded):
+            # 远端路径是 POSIX 语义，Windows 上 os.path.basename 认不出 '/' 分隔
+            if entry.name == posixpath.basename(just_uploaded):
                 continue  # 绝不删除刚上传的那一份
             try:
                 client.delete_file(cfg.remote_dir.rstrip('/') + '/' + entry.name)

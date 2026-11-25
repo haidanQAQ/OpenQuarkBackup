@@ -52,6 +52,9 @@ class FakeOpenList:
         self.json_401_remaining = 0
         #: True 时所有业务请求都返回 200 + code=401（验证不会无限递归重登）
         self.json_401_always = False
+        #: 登录接口直接返回 HTTP 401 / HTTP 200 + code=401（验证登录失败不会递归）
+        self.login_http_401 = False
+        self.login_json_401 = False
         self.login_count = 0
         self._lock = threading.Lock()
         self._next_task = 1
@@ -96,6 +99,10 @@ class FakeOpenList:
                     fake.request_count += 1
                 if path == '/api/auth/login':
                     data = json.loads(self._body() or b'{}')
+                    if fake.login_http_401:
+                        return self._reply(401, {'code': 401, 'message': 'login rejected'})
+                    if fake.login_json_401:
+                        return self._reply(200, {'code': 401, 'message': 'login rejected'})
                     if data.get('username') == 'admin' and data.get('password') == 'secret':
                         fake.login_count += 1
                         return self._reply(200, {'code': 200, 'data': {'token': TOKEN}})
@@ -269,17 +276,26 @@ class FakeOpenList:
 
 
 class FakeServer:
-    """冒充 MCDR 的 PluginServerInterface（只用到这两个方法）。"""
+    """冒充 MCDR 的 PluginServerInterface（只用到这几个方法）。"""
 
     def __init__(self, root):
         self.root = root
         self._logger = logging.getLogger('oqb.test')
         self._logger.addHandler(logging.NullHandler())
         self._logger.propagate = False
+        #: 注册过的命令节点与帮助信息，用来验证"配置坏了也要能注册命令"
+        self.commands = []
+        self.help_messages = []
 
     @property
     def logger(self):
         return self._logger
+
+    def register_command(self, node, *args, **kwargs):
+        self.commands.append(node)
+
+    def register_help_message(self, prefix, message, permission=0):
+        self.help_messages.append((prefix, message, permission))
 
     def get_data_folder(self):
         path = os.path.join(self.root, 'config', 'open_quark_backup')
@@ -544,6 +560,87 @@ class JobEndToEndTest(unittest.TestCase):
         client = OpenListClient(self.fake.url, username='admin', password='secret', timeout=30.0)
         client.ensure_dir(REMOTE_DIR)
         self.assertEqual(self.fake.mkdir_calls, [], '目录已存在时不应调用 mkdir')
+
+    # ------------------------------------------------------------ 二轮审计回归
+    def test_ensure_dir_rejects_file_in_the_way(self):
+        """远端有个同名普通文件占着目录路径时，必须明确报错而不是静默继续。"""
+        # '/夸克/Minecraft_Backup' 是文件而不是目录
+        self.fake.files[REMOTE_DIR] = b'not a directory'
+        client = OpenListClient(self.fake.url, username='admin', password='secret', timeout=30.0)
+        with self.assertRaises(OpenListError) as ctx:
+            client.ensure_dir(REMOTE_DIR)
+        self.assertIn('同名文件', str(ctx.exception))
+        self.assertNotIn(REMOTE_DIR, self.fake.mkdir_calls)
+
+    def test_login_http_401_raises_without_recursion(self):
+        """登录接口返回 HTTP 401 时直接报错：不能再触发"重新登录"把自己递归进去。"""
+        self.fake.login_http_401 = True
+        client = OpenListClient(self.fake.url, username='admin', password='secret', timeout=30.0)
+        before = self.fake.request_count
+        with self.assertRaises(OpenListError):
+            client.login()
+        self.assertEqual(self.fake.request_count - before, 1, '登录失败后不应再重试')
+        self.assertEqual(self.fake.login_count, 0)
+        self.assertEqual(client._token, '')  # noqa: SLF001
+
+    def test_login_json_401_raises_without_recursion(self):
+        """登录接口返回 HTTP 200 + {"code": 401}（密码错）时同样不能递归重登。"""
+        self.fake.login_json_401 = True
+        client = OpenListClient(self.fake.url, username='admin', password='secret', timeout=30.0)
+        before = self.fake.request_count
+        with self.assertRaises(OpenListError):
+            client.login()
+        self.assertEqual(self.fake.request_count - before, 1)
+        self.assertEqual(self.fake.login_count, 0)
+
+
+class BrokenConfigTest(unittest.TestCase):
+    """config.json 写坏时，命令仍要注册上，修好文件后一条 !!oqb reload 就能恢复。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix='oqb_broken_')
+        self.server = FakeServer(self.root)
+        self.pb_dir, self.db_path = make_pb_files(self.root)
+        self.config_path = os.path.join(self.server.get_data_folder(), 'config.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_load_registers_commands_even_when_config_is_broken(self):
+        with io.open(self.config_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write('{ this is not json ')
+        plugin = OpenQuarkBackupPlugin(self.server)
+
+        plugin.load()  # 不能抛异常
+
+        self.assertIsNone(plugin.resolved, '配置坏了就不该有解析结果')
+        self.assertIsNone(plugin.job)
+        self.assertEqual(len(self.server.commands), 1, '命令必须注册，否则运维没法 reload')
+        self.assertEqual(len(self.server.help_messages), 1)
+        self.assertEqual(self.server.help_messages[0][0], '!!oqb')
+
+    def test_reload_recovers_after_config_is_fixed(self):
+        with io.open(self.config_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write('{ broken ')
+        plugin = OpenQuarkBackupPlugin(self.server)
+        plugin.load()
+        self.assertIsNone(plugin.resolved)
+
+        # 运维把文件改回合法 JSON，然后直接 !!oqb reload
+        payload = {
+            'pb_files_dir': self.pb_dir,
+            'temp_dir': os.path.join(self.root, 'tmp'),
+            'cron': '0 2 * * 1',
+        }
+        with io.open(self.config_path, 'w', encoding='utf-8', newline='\n') as f:
+            json.dump(payload, f)
+        try:
+            plugin._reload()  # noqa: SLF001
+            self.assertIsNotNone(plugin.resolved)
+            self.assertIsNotNone(plugin.job)
+            self.assertEqual(plugin.job.config.pb_files_dir, self.pb_dir)
+        finally:
+            plugin.unload()
 
 
 class ReloadKeepsJobTest(unittest.TestCase):

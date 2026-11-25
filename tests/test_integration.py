@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from open_quark_backup.config import Config, resolve_config  # noqa: E402
 from open_quark_backup.job import BackupJob  # noqa: E402
-from open_quark_backup.openlist_api import OpenListClient  # noqa: E402
+from open_quark_backup.openlist_api import OpenListClient, OpenListError  # noqa: E402
+from open_quark_backup import OpenQuarkBackupPlugin  # noqa: E402
 
 TOKEN = 'test-token'
 REMOTE_DIR = '/夸克/Minecraft_Backup'
@@ -42,8 +43,15 @@ class FakeOpenList:
         self.removed = []
         self.canceled = []
         self.deleted = []
+        self.mkdir_calls = []
+        self.task_info_paths = []
+        self.request_count = 0
         self.fail_tasks = set()
         self.fail_next_task = False
+        #: 接下来多少次业务请求返回 HTTP 200 + {"code": 401}（模拟 AList 的鉴权失效报文）
+        self.json_401_remaining = 0
+        #: True 时所有业务请求都返回 200 + code=401（验证不会无限递归重登）
+        self.json_401_always = False
         self.login_count = 0
         self._lock = threading.Lock()
         self._next_task = 1
@@ -71,9 +79,21 @@ class FakeOpenList:
             def _authorized(self):
                 return self.headers.get('Authorization') == TOKEN
 
+            def _json_401(self):
+                """按需伪造 AList 的「HTTP 200 + code 401」鉴权失效。"""
+                with fake._lock:
+                    if fake.json_401_always:
+                        return True
+                    if fake.json_401_remaining > 0:
+                        fake.json_401_remaining -= 1
+                        return True
+                return False
+
             def do_POST(self):
                 parsed = urllib.parse.urlsplit(self.path)
                 path = parsed.path
+                with fake._lock:
+                    fake.request_count += 1
                 if path == '/api/auth/login':
                     data = json.loads(self._body() or b'{}')
                     if data.get('username') == 'admin' and data.get('password') == 'secret':
@@ -83,11 +103,14 @@ class FakeOpenList:
 
                 if not self._authorized():
                     return self._reply(401, {'code': 401, 'message': 'token is invalidated'})
+                if self._json_401():
+                    return self._reply(200, {'code': 401, 'message': 'token is invalidated'})
 
                 if path == '/api/fs/mkdir':
                     target = json.loads(self._body())['path']
                     parent = os.path.dirname(target.rstrip('/')) or '/'
                     with fake._lock:
+                        fake.mkdir_calls.append(target)
                         if parent not in fake.dirs:
                             return self._reply(200, {'code': 500, 'message': 'parent not exist'})
                         fake.dirs.add(target)
@@ -114,6 +137,12 @@ class FakeOpenList:
                                 'name': os.path.basename(target),
                                 'size': len(fake.files[target]),
                                 'is_dir': False,
+                            }})
+                        if target in fake.dirs:
+                            return self._reply(200, {'code': 200, 'data': {
+                                'name': os.path.basename(target) or '/',
+                                'size': 0,
+                                'is_dir': True,
                             }})
                     return self._reply(500, {'code': 500, 'message': 'object not found'})
 
@@ -143,7 +172,9 @@ class FakeOpenList:
                         fake.tasks.pop(tid, None)
                     return self._reply(200, {'code': 200})
 
-                if path == '/api/task/info':
+                if path in ('/api/task/upload/info', '/api/task/info'):
+                    with fake._lock:
+                        fake.task_info_paths.append(path)
                     tid = urllib.parse.parse_qs(parsed.query).get('tid', [''])[0]
                     with fake._lock:
                         task = fake.tasks.get(tid)
@@ -164,15 +195,25 @@ class FakeOpenList:
                             'progress': 50.0 if state == 1 else 100.0,
                         }})
 
+                if path == '/api/admin/task/upload/info':
+                    # 只有根路由存在时才会走到这里；测试里默认让管理端路由 404，
+                    # 用来证明客户端用的是 /api/task/upload/info
+                    return self._reply(404, {'code': 404, 'message': 'no such endpoint'})
+
                 return self._reply(404, {'code': 404, 'message': 'no such endpoint'})
 
             def do_PUT(self):
                 parsed = urllib.parse.urlsplit(self.path)
+                with fake._lock:
+                    fake.request_count += 1
                 if parsed.path != '/api/fs/put':
                     return self._reply(404, {'code': 404, 'message': 'no such endpoint'})
                 if not self._authorized():
                     self._body()
                     return self._reply(401, {'code': 401, 'message': 'token is invalidated'})
+                if self._json_401():
+                    self._body()
+                    return self._reply(200, {'code': 401, 'message': 'token is invalidated'})
 
                 raw_target = self.headers.get('File-Path') or ''
                 target = urllib.parse.unquote(raw_target)
@@ -247,6 +288,19 @@ class FakeServer:
 
     def get_mcdr_config(self):
         return {'working_directory': os.path.join(self.root, 'server')}
+
+    def load_config_simple(self, file_name='config.json', target_class=Config,
+                           encoding='utf-8', **_kwargs):
+        """冒充 MCDR 的配置读取（只支持我们自己的 Config）。"""
+        path = os.path.join(self.get_data_folder(), file_name)
+        cfg = target_class() if target_class is not None else {}
+        if os.path.isfile(path):
+            with io.open(path, encoding=encoding) as f:
+                raw = json.load(f)
+            for key, value in raw.items():
+                if hasattr(cfg, key):
+                    setattr(cfg, key, value)
+        return cfg
 
 
 def make_pb_files(root):
@@ -436,6 +490,116 @@ class JobEndToEndTest(unittest.TestCase):
         # 失败也要清理临时文件
         leftovers = os.listdir(cfg.temp_dir) if os.path.isdir(cfg.temp_dir) else []
         self.assertEqual([n for n in leftovers if n.endswith(('.tar', '.db'))], [])
+
+    # ------------------------------------------------------------ 审查问题回归
+    def test_task_info_uses_upload_route(self):
+        """任务查询必须走 /api/task/upload/info（分组路由），不是 /api/task/info。"""
+        client = OpenListClient(self.fake.url, username='admin', password='secret',
+                                timeout=30.0, as_task=True)
+        local = os.path.join(self.root, 'payload.bin')
+        with open(local, 'wb') as f:
+            f.write(os.urandom(128 * 1024))
+        client.upload(local, '/夸克/Minecraft_Backup/route.bin')
+        self.assertTrue(self.fake.task_info_paths)
+        self.assertEqual(self.fake.task_info_paths[0], '/api/task/upload/info')
+        self.assertNotIn('/api/task/info', self.fake.task_info_paths)
+
+    def test_json_401_triggers_exactly_one_relogin(self):
+        """HTTP 200 + {"code": 401} 也算鉴权失效：清 token、重登、原请求重试一次。"""
+        self.fake.dirs.update({'/夸克', REMOTE_DIR})
+        # 用当前有效的 token，确保触发的是 body 里的 code=401 而不是 HTTP 401
+        client = OpenListClient(self.fake.url, token=TOKEN,
+                                username='admin', password='secret', timeout=30.0)
+        self.fake.json_401_remaining = 1
+        items = client.list_dir(REMOTE_DIR, refresh=True)
+        self.assertEqual(items, [])
+        self.assertEqual(self.fake.login_count, 1, '应恰好重登一次')
+        self.assertEqual(client._token, TOKEN)  # noqa: SLF001
+
+    def test_json_401_never_recurses(self):
+        """持续 401 时必须抛错而不是无限重登（retry_auth 防递归保护）。"""
+        self.fake.dirs.update({'/夸克', REMOTE_DIR})
+        client = OpenListClient(self.fake.url, token='stale-token',
+                                username='admin', password='secret', timeout=30.0)
+        self.fake.json_401_always = True
+        before = self.fake.request_count
+        with self.assertRaises(OpenListError):
+            client.list_dir(REMOTE_DIR, refresh=True)
+        attempts = self.fake.request_count - before
+        # 1 次原请求 + 1 次重登 + 1 次重试，绝不能再多
+        self.assertLessEqual(attempts, 3, '重试次数失控: {} 次请求'.format(attempts))
+        self.assertEqual(self.fake.login_count, 1)
+
+    def test_ensure_dir_skips_existing_mount_root(self):
+        """挂载根 /夸克 已存在时，ensure_dir 不能再去 mkdir 它。"""
+        self.fake.dirs.add('/夸克')
+        client = OpenListClient(self.fake.url, username='admin', password='secret', timeout=30.0)
+        client.ensure_dir(REMOTE_DIR)
+        self.assertNotIn('/夸克', self.fake.mkdir_calls)
+        self.assertIn(REMOTE_DIR, self.fake.mkdir_calls)
+        self.assertIn(REMOTE_DIR, self.fake.dirs)
+
+    def test_ensure_dir_is_idempotent_when_target_exists(self):
+        self.fake.dirs.update({'/夸克', REMOTE_DIR})
+        client = OpenListClient(self.fake.url, username='admin', password='secret', timeout=30.0)
+        client.ensure_dir(REMOTE_DIR)
+        self.assertEqual(self.fake.mkdir_calls, [], '目录已存在时不应调用 mkdir')
+
+
+class ReloadKeepsJobTest(unittest.TestCase):
+    """``!!oqb reload`` 不能重建 BackupJob，否则运行中的互斥锁就没了。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix='oqb_reload_')
+        self.server = FakeServer(self.root)
+        self.pb_dir, self.db_path = make_pb_files(self.root)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def make_resolved(self, cron='0 2 * * 1'):
+        cfg = Config()
+        cfg.pb_files_dir = self.pb_dir
+        cfg.temp_dir = os.path.join(self.root, 'tmp')
+        cfg.cron = cron
+        return resolve_config(cfg, self.server)
+
+    def test_reload_keeps_same_job_instance(self):
+        plugin = OpenQuarkBackupPlugin(self.server)
+        plugin._reload(initial=True)  # noqa: SLF001
+        job = plugin.job
+        self.assertIsNotNone(job)
+        plugin._reload()  # noqa: SLF001
+        self.assertIs(plugin.job, job, 'reload 不应重建 BackupJob')
+        self.assertEqual(plugin.job.config.cron_expression, '0 2 * * 1')
+
+    def test_reload_does_not_break_running_lock(self):
+        job = BackupJob(self.make_resolved(), self.server.logger)
+        # 直接占住互斥锁，模拟"任务正在运行"
+        self.assertTrue(job._lock.acquire(blocking=False))  # noqa: SLF001
+        try:
+            job.update_config(self.make_resolved(cron='30 3 * * *'))
+            self.assertFalse(job.start('manual'), '运行中必须拒绝并发启动')
+            self.assertTrue(job.is_running())
+            self.assertEqual(job.config.cron_expression, '30 3 * * *')
+        finally:
+            job._lock.release()  # noqa: SLF001
+
+    def test_update_config_swaps_config_only(self):
+        job = BackupJob(self.make_resolved(), self.server.logger)
+        old_lock = job._lock  # noqa: SLF001
+        job.update_config(self.make_resolved(cron='0 4 * * *'))
+        self.assertIs(job._lock, old_lock)  # noqa: SLF001
+        self.assertEqual(job.config.cron_expression, '0 4 * * *')
+
+    def test_unload_joins_scheduler(self):
+        plugin = OpenQuarkBackupPlugin(self.server)
+        plugin._reload(initial=True)  # noqa: SLF001
+        scheduler = plugin.scheduler
+        self.assertTrue(scheduler.is_alive())
+        plugin.unload()
+        self.assertFalse(scheduler.is_alive(), '卸载后调度线程必须退出')
+        self.assertIsNone(plugin.scheduler)
 
 
 if __name__ == '__main__':

@@ -55,7 +55,6 @@ class OpenQuarkBackupPlugin:
         self.job: Optional[BackupJob] = None
         self.scheduler: Optional[CronScheduler] = None
         self.enabled = True
-        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ 生命周期
     def load(self) -> None:
@@ -70,6 +69,8 @@ class OpenQuarkBackupPlugin:
     def unload(self) -> None:
         if self.scheduler is not None:
             self.scheduler.stop()
+            # 等调度线程真的退出，避免插件重载后新旧两个调度线程同时在跑
+            self.scheduler.join(timeout=2.0)
             self.scheduler = None
         if self.job is not None:
             self.job.cancel()
@@ -87,7 +88,13 @@ class OpenQuarkBackupPlugin:
         if resolved.tz_error:
             self.logger.warning(resolved.tz_error)
 
-        self.job = BackupJob(resolved, self.logger, on_finished=self._on_job_finished)
+        # 保留同一个 BackupJob：它身上挂着互斥锁、取消信号和上次运行结果。
+        # 如果 reload 时重建实例，正在跑的那次任务就失去了锁保护（定时触发可能并发挤进来），
+        # status / cancel 也会指向一个空壳。这里只把新配置递进去，下次 start() 生效。
+        if self.job is None:
+            self.job = BackupJob(resolved, self.logger, on_finished=self._on_job_finished)
+        else:
+            self.job.update_config(resolved)
 
         if self.scheduler is None:
             self.scheduler = CronScheduler(
@@ -129,7 +136,7 @@ class OpenQuarkBackupPlugin:
         # 失败原因已由 BackupJob 记录过一条完整日志，这里只补一句结论，避免重复打印
         if summary.get('last_ok'):
             self.logger.info('OpenQuarkBackup 任务完成: {}（{}）'.format(
-                summary.get('last_name'), summary.get('last_size')))
+                summary.get('last_name'), human_size(summary.get('last_size') or 0)))
         else:
             self.logger.error('OpenQuarkBackup 任务失败，可执行 !!oqb status 查看原因')
 
@@ -203,8 +210,8 @@ class OpenQuarkBackupPlugin:
             source.reply(RText('  上次结束: {}'.format(
                 summary['finished_at'].strftime('%Y-%m-%d %H:%M:%S %z')), RColor.gray))
         if summary['last_name']:
-            source.reply(RText('  上次文件: {}（{} 字节，耗时 {:.1f} 秒）'.format(
-                summary['last_name'], summary['last_size'], summary['last_duration']), RColor.gray))
+            source.reply(RText('  上次文件: {}（{}，耗时 {:.1f} 秒）'.format(
+                summary['last_name'], human_size(summary['last_size']), summary['last_duration']), RColor.gray))
         if summary['last_ok'] is True:
             source.reply(RText('  上次结果: 成功', RColor.green))
         elif summary['last_ok'] is False:

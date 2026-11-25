@@ -8,9 +8,10 @@ OpenList REST API 客户端（兼容 AList v3 协议）。
 实现要点：
 * 上传走 ``PUT /api/fs/put`` 的原始流式接口，用 http.client 分块发送，
   不会把整个备份包读进内存（8GB 机器上传数 GB 文件也不会炸）；
-* ``as_task=true`` 时接口只返回一个任务 id，必须轮询 ``/api/task/info``
+* ``as_task=true`` 时接口只返回一个任务 id，必须轮询 ``/api/task/upload/info``
   直到任务真正结束，否则会把"已入队"误判成"已上传"；
-* Token 过期（401）时自动用账号密码重新登录并重试一次。
+* Token 过期时自动用账号密码重新登录并重试一次。OpenList/AList 的鉴权失效既可能
+  是 HTTP 401，也可能被包成 HTTP 200 + ``{"code": 401}``，两种都要认。
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import posixpath
 import time
 import urllib.error
 import urllib.parse
@@ -45,6 +47,13 @@ UPLOAD_CHUNK_SIZE = 1024 * 1024
 #: 轮询任务状态的间隔（秒）。
 TASK_POLL_INTERVAL = 1.5
 
+#: 任务查询路由。新版 OpenList 把任务按分组挂在 ``/api/task/upload/info`` 下，
+#: 个别反向代理/管理端配置只暴露 ``/api/admin/task/upload/info``；两条都试，命中的记下来复用。
+TASK_INFO_ROUTES = (
+    '/api/task/upload/info',
+    '/api/admin/task/upload/info',
+)
+
 
 class OpenListError(Exception):
     """OpenList 接口调用失败。``status`` 为 HTTP 状态码（网络错误时为 None）。"""
@@ -66,6 +75,8 @@ class OpenListClient:
         self.logger = logger
         #: 最近一次上传产生的任务 id，失败时可据此取消，避免僵尸任务堆在 OpenList 里
         self.last_task_id: Optional[str] = None
+        #: 已经验证可用的任务查询路由（首次查询时探测后缓存）
+        self._task_info_route: Optional[str] = None
         if not self.base_url:
             raise OpenListError('openlist_url 未配置')
 
@@ -98,6 +109,15 @@ class OpenListClient:
         except ValueError:
             raise OpenListError('OpenList 返回了非 JSON 内容: {!r}'.format(text[:200])) from None
 
+    def _relogin(self, where: str) -> None:
+        """清掉失效的 token 并用账号密码重新登录（调用方负责重试一次）。"""
+        self._log('warning', '{} 时 OpenList Token 失效，尝试用账号密码重新登录'.format(where))
+        self._token = ''
+        self.login()
+
+    def _has_credentials(self) -> bool:
+        return bool(self.username or self.password)
+
     def _request_json(self, method: str, path: str, body: Optional[dict] = None,
                       auth: bool = True, retry_auth: bool = True) -> dict:
         data = None
@@ -116,10 +136,8 @@ class OpenListClient:
                 raw = e.read()
             except Exception:
                 pass
-            if e.code == 401 and retry_auth and (self.username or self.password):
-                self._log('warning', 'OpenList Token 失效，尝试用账号密码重新登录')
-                self._token = ''
-                self.login()
+            if e.code == 401 and retry_auth and self._has_credentials():
+                self._relogin('HTTP 401')
                 return self._request_json(method, path, body, auth=auth, retry_auth=False)
             message = self._error_message(raw) or 'HTTP {}'.format(e.code)
             raise OpenListError('{} {} 失败: {}'.format(method, path, message), status=e.code) from None
@@ -127,6 +145,10 @@ class OpenListClient:
             raise OpenListError('{} {} 网络错误: {}'.format(method, path, e)) from None
 
         payload = self._decode(raw)
+        # AList/OpenList 在鉴权失效时经常仍返回 HTTP 200，只在 body 里写 code=401
+        if payload.get('code') == 401 and retry_auth and self._has_credentials():
+            self._relogin('code=401')
+            return self._request_json(method, path, body, auth=auth, retry_auth=False)
         if payload.get('code') not in (200, None):
             raise OpenListError('{} {} 返回错误: {}'.format(method, path, payload.get('message') or payload),
                                 status=payload.get('code'))
@@ -173,11 +195,25 @@ class OpenListClient:
             raise
 
     def ensure_dir(self, path: str) -> None:
-        """逐级创建远端目录（父目录不存在时 AList 的 mkdir 会失败）。"""
-        parts = [p for p in (path or '').split('/') if p]
+        """
+        逐级确保远端目录存在。
+
+        AList 的 ``mkdir`` 在父目录不存在时会直接失败，所以要一级一级建；但反过来，
+        对已经存在的层级重复 ``mkdir`` 会白打请求、某些驱动还会报错。因此每一级都先
+        ``get`` 探测：存在就跳过，不存在才建。挂载点根目录（``/夸克`` 这类）同理，
+        已经存在时不会被再次创建。
+        """
+        normalized = (path or '').strip()
+        if not normalized or normalized == '/':
+            return
+        if self.get(normalized):
+            return
+
         current = ''
-        for part in parts:
+        for part in [p for p in normalized.split('/') if p]:
             current += '/' + part
+            if self.get(current):
+                continue
             self.mkdir(current)
 
     def list_dir(self, path: str, refresh: bool = True) -> List[dict]:
@@ -212,18 +248,22 @@ class OpenListClient:
         self._request_json('POST', '/api/fs/remove', {'dir': dir_path, 'names': list(names)})
 
     def delete_file(self, path: str) -> None:
-        dir_path, name = os.path.split(path)
+        # 远端路径是 POSIX 语义（永远用 '/' 分隔），不能用 os.path.split：
+        # 在 Windows 上它只认 '\\'，会把整个路径当成文件名。
+        dir_path, name = posixpath.split('/' + (path or '').lstrip('/'))
         self.remove(dir_path or '/', [name])
 
     # ---------------------------------------------------------------- 上传
     def upload(self, local_path: str, remote_path: str, as_task: Optional[bool] = None,
                progress: Optional[Callable[[int, int], None]] = None,
-               cancel_check: Optional[Callable[[], bool]] = None) -> dict:
+               cancel_check: Optional[Callable[[], bool]] = None,
+               retry_auth: bool = True) -> dict:
         """
         流式上传本地文件到远端路径。
 
-        * ``as_task`` 为 True 时会等待任务真正完成（轮询 ``/api/task/info``）；
+        * ``as_task`` 为 True 时会等待任务真正完成（轮询 ``/api/task/upload/info``）；
         * 返回接口的 ``data`` 字典（可能含 ``task``）；
+        * ``retry_auth`` 只允许重试一轮：重新登录后仍 401 就抛错，不会无限递归；
         * 网络错误/5xx 会抛 :class:`OpenListError`，由调用方决定是否重试。
         """
         if not os.path.isfile(local_path):
@@ -277,17 +317,20 @@ class OpenListClient:
             except Exception:
                 pass
 
-        if status == 401 and (self.username or self.password):
-            self._log('warning', '上传时 Token 失效，重新登录后重试一次')
-            self._token = ''
-            self.login()
-            return self.upload(local_path, remote_path, as_task=as_task,
-                               progress=progress, cancel_check=cancel_check)
+        if status == 401 and retry_auth and self._has_credentials():
+            self._relogin('上传返回 HTTP 401')
+            return self.upload(local_path, remote_path, as_task=as_task, progress=progress,
+                               cancel_check=cancel_check, retry_auth=False)
         if status >= 400:
             message = self._error_message(raw) or 'HTTP {}'.format(status)
             raise OpenListError('上传失败（{}）: {}'.format(status, message), status=status)
 
         payload = self._decode(raw)
+        if payload.get('code') == 401 and retry_auth and self._has_credentials():
+            # 同样是"HTTP 200 + body 里 code=401"的鉴权失效，重登后再发一次，最多一轮
+            self._relogin('上传返回 code=401')
+            return self.upload(local_path, remote_path, as_task=as_task, progress=progress,
+                               cancel_check=cancel_check, retry_auth=False)
         if payload.get('code') not in (200, None):
             raise OpenListError('上传被拒绝: {}'.format(payload.get('message') or payload))
 
@@ -309,10 +352,34 @@ class OpenListClient:
 
     # ---------------------------------------------------------------- 任务
     def task_info(self, task_id: str) -> Optional[dict]:
-        payload = self._request_json('POST', '/api/task/info?tid={}'.format(
-            urllib.parse.quote(str(task_id))), {})
-        data = payload.get('data')
-        return data if isinstance(data, dict) else None
+        """
+        查询上传任务状态。
+
+        OpenList 的路由是 ``/api/task/upload/info?tid=<id>``（任务按分组挂在
+        ``/api/task/<group>/`` 下，上传组的 group 就是 ``upload``）；个别只暴露管理端
+        路由的环境退到 ``/api/admin/task/upload/info``。首次探测成功的路由会被缓存，
+        之后不再重复试探。
+        """
+        query = '?tid={}'.format(urllib.parse.quote(str(task_id)))
+        routes = (self._task_info_route,) if self._task_info_route else TASK_INFO_ROUTES
+        last_error: Optional[OpenListError] = None
+        for route in routes:
+            if not route:
+                continue
+            try:
+                payload = self._request_json('POST', route + query, {})
+            except OpenListError as e:
+                last_error = e
+                if e.status == 404:
+                    self._log('debug', '任务查询路由 {} 不存在，尝试下一条'.format(route))
+                    continue
+                raise
+            self._task_info_route = route
+            data = payload.get('data')
+            return data if isinstance(data, dict) else None
+        if last_error is not None:
+            raise last_error
+        return None
 
     def cancel_task(self, task_id: str) -> bool:
         """取消一个上传任务（成功后它会进入已取消，不再占「待处理」）。"""
@@ -364,15 +431,35 @@ class OpenListClient:
 
     # ---------------------------------------------------------------- 校验
     def verify(self, remote_path: str, expected_size: int) -> bool:
-        """确认远端文件存在且大小一致。"""
-        info = self.get(remote_path)
-        if not info:
+        """
+        确认远端文件存在且大小一致。
+
+        夸克这类网盘在刚上传完的瞬间，``/api/fs/get`` 可能仍然命中旧缓存（报未找到或
+        旧的 size）。第一次核对不通过时，先对父目录做一次 ``refresh=true`` 的强制刷新，
+        再从列表里二次核对，避免把"其实已经成功"的上传误判成失败、进而重试出一条重复包。
+        """
+        if self._size_matches(self.get(remote_path), expected_size):
+            return True
+
+        parent, name = posixpath.split('/' + (remote_path or '').lstrip('/'))
+        try:
+            items = self.list_dir(parent or '/', refresh=True)
+        except OpenListError as e:
+            self._log('warning', '校验前刷新远端目录失败: {}'.format(e))
+            return False
+        for item in items:
+            if isinstance(item, dict) and item.get('name') == name:
+                return self._size_matches(item, expected_size)
+        return False
+
+    @staticmethod
+    def _size_matches(info: Optional[dict], expected_size: int) -> bool:
+        if not isinstance(info, dict):
             return False
         try:
-            size = int(info.get('size') or 0)
+            return int(info.get('size') or 0) == int(expected_size)
         except (TypeError, ValueError):
             return False
-        return size == int(expected_size)
 
 
 def redact(value: str) -> str:

@@ -34,6 +34,9 @@ class BackupJob:
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        #: 正在运行的那一次任务用的配置快照。``!!oqb reload`` 只更新 ``self.config``，
+        #: 跑着的那一次仍然按开跑时的配置走，避免中途换掉 temp_dir/远端目录把流程搞乱。
+        self._active_config: Optional[ResolvedConfig] = None
 
         self.phase = PHASE_IDLE
         self.trigger = ''
@@ -48,6 +51,17 @@ class BackupJob:
         self.last_duration = 0.0
 
     # ------------------------------------------------------------------ 查询
+    def update_config(self, config: ResolvedConfig) -> None:
+        """
+        热重载配置时只替换配置对象，**不重建 BackupJob 实例**。
+
+        互斥锁、取消信号、上次运行结果都挂在这个实例上；重建实例等于把锁也换新的，
+        正在跑的任务会失去保护（定时触发可能挤进来并发），``!!oqb status`` 和取消也会
+        指向一个空壳。下一次 ``start()`` 会用新配置。
+        """
+        self.config = config
+        self.logger.debug('OpenQuarkBackup 任务配置已更新（下次执行生效）')
+
     def is_running(self) -> bool:
         return self._lock.locked()
 
@@ -99,6 +113,7 @@ class BackupJob:
             self.last_duration = time.time() - started
             self.finished_at = self._now()
             self.phase = PHASE_IDLE
+            self._active_config = None
             self._lock.release()
             summary = self.summary()
             if self.on_finished is not None:
@@ -107,9 +122,14 @@ class BackupJob:
                 except Exception:
                     self.logger.exception('任务完成回调出错')
 
+    def _cfg(self) -> ResolvedConfig:
+        """当前这次运行使用的配置（运行中锁定为开跑时的快照）。"""
+        return self._active_config or self.config
+
     # ------------------------------------------------------------------ 主流程
     def _run(self) -> None:
         cfg = self.config
+        self._active_config = cfg
         now = datetime.now(cfg.tz)
         name = prune.format_backup_name(cfg.filename_prefix, now)
         remote_path = cfg.remote_dir.rstrip('/') + '/' + name
@@ -125,24 +145,32 @@ class BackupJob:
             raise RuntimeError('找不到 PrimeBackup 数据库: {}（请检查 pb_files_dir）'.format(cfg.db_path))
         os.makedirs(cfg.temp_dir, exist_ok=True)
 
-        # 2) 扫描与空间检查
-        payload = packer.scan_payload(cfg.pb_files_dir, cfg.db_path)
-        if not payload.files and payload.total_bytes <= 0:
-            raise RuntimeError('仓库目录里没有可打包的内容: {}'.format(cfg.pb_files_dir))
-        self.logger.info('待打包 {} 个文件，约 {}（数据库 {}）'.format(
-            payload.file_count, _human(payload.total_bytes), cfg.db_name))
-        packer.check_free_space(cfg.temp_dir, payload.total_bytes, cfg.min_free_space_ratio)
-
+        # 2) 数据库快照 → 再扫描 → 再算空间 → 最后打包
+        #
+        # 顺序很重要：PB 是先往 blobs/packs 落数据、再提交数据库记录的，如果先扫描后快照，
+        # 扫描和快照之间新提交的 blob 就会出现"库里记了、包里没有"的缺口，恢复时校验失败。
+        # 所以先用在线备份 API 定住数据库这一刻的一致性视图，再按这个视图扫描数据目录。
         tar_path = os.path.join(cfg.temp_dir, name)
-        snapshot_path = os.path.join(cfg.temp_dir, '._snapshot_{}.db'.format(name))
+        # 快照文件名不能以 '._' 开头：exFAT / macOS 的 AppleDouble 文件正是这个前缀，
+        # 会被清理逻辑和运维的过滤规则误当成系统垃圾文件。
+        snapshot_path = os.path.join(cfg.temp_dir, 'oqb_snapshot_{}.db'.format(name))
         started_ts = time.time()
         uploaded_size = 0
         try:
-            # 3) 数据库快照 + 无压缩 tar
             self.phase = PHASE_PACKING
             self.logger.info('导出 SQLite 一致性快照 …')
             packer.snapshot_database(cfg.db_path, snapshot_path)
             self._check_cancel()
+
+            payload = packer.scan_payload(cfg.pb_files_dir, cfg.db_path)
+            if not payload.files and payload.total_bytes <= 0:
+                raise RuntimeError('仓库目录里没有可打包的内容: {}'.format(cfg.pb_files_dir))
+            self.logger.info('待打包 {} 个文件，约 {}（数据库 {}）'.format(
+                payload.file_count, _human(payload.total_bytes), cfg.db_name))
+
+            # 暂存盘要同时容纳：归档本身 + 数据库快照 + PB 的 -wal 文件（如果还没 checkpoint）
+            needed = payload.total_bytes + os.path.getsize(snapshot_path) + packer.wal_size(cfg.db_path)
+            packer.check_free_space(cfg.temp_dir, needed, cfg.min_free_space_ratio)
 
             extra = []
             if cfg.include_pb_config and cfg.pb_config_path:
@@ -187,7 +215,7 @@ class BackupJob:
 
     # ------------------------------------------------------------------ 子步骤
     def _client(self) -> OpenListClient:
-        cfg = self.config
+        cfg = self._cfg()
         if not cfg.openlist_token and not (cfg.openlist_username and cfg.openlist_password):
             raise RuntimeError('OpenList 凭据缺失：请填写 openlist_token 或 openlist_username/password')
         return OpenListClient(
@@ -201,7 +229,7 @@ class BackupJob:
         )
 
     def _upload_with_retry(self, client: OpenListClient, tar_path: str, remote_path: str, size: int) -> None:
-        cfg = self.config
+        cfg = self._cfg()
         attempts = cfg.retry_times + 1
         last_error: Optional[Exception] = None
         for attempt in range(1, attempts + 1):
@@ -236,7 +264,7 @@ class BackupJob:
         raise RuntimeError('上传重试 {} 次后仍失败: {}'.format(attempts, last_error))
 
     def _prune(self, client: OpenListClient, just_uploaded: str) -> None:
-        cfg = self.config
+        cfg = self._cfg()
         if cfg.max_keep <= 0:
             self.logger.info('max_keep={} <= 0，跳过自动清理（永久保留所有备份）'.format(cfg.max_keep))
             return
@@ -286,7 +314,7 @@ class BackupJob:
             raise RuntimeError('任务已取消')
 
     def _now(self) -> datetime:
-        return datetime.now(self.config.tz)
+        return datetime.now(self._cfg().tz)
 
 
 def _human(num: int) -> str:

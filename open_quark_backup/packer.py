@@ -147,6 +147,20 @@ def free_space_bytes(path: str) -> int:
         return 0
 
 
+def wal_size(db_path: str) -> int:
+    """返回数据库 ``-wal`` / ``-shm`` 附属文件的总体积（都没有则为 0）。
+
+    打包前算暂存空间时要把它算进去：WAL 可能比主库还大，而快照和 tar 都要占地方。
+    """
+    total = 0
+    for suffix in ('-wal', '-shm'):
+        try:
+            total += os.path.getsize(db_path + suffix)
+        except OSError:
+            pass
+    return total
+
+
 def check_free_space(temp_dir: str, needed_bytes: int, ratio: float) -> None:
     """打包前检查暂存盘剩余空间；不足则抛 :class:`PackError`。"""
     os.makedirs(temp_dir, exist_ok=True)
@@ -167,6 +181,10 @@ def snapshot_database(db_path: str, snapshot_path: str, timeout: float = 60.0) -
 
     与直接复制文件不同，backup API 会通过 SQLite 自己的一致性读取视图取数据，
     因此即使服务端/PB 正在写库，快照也是完整可用的（WAL 中的已提交事务同样包含在内）。
+
+    ``pages=256`` / ``sleep=0.01`` 让备份分小批进行、批间让出 GIL 与读锁：否则一次
+    ``backup()`` 会把整库拉进一次长事务，PB 那边写备份元数据时会被阻塞住（表现为
+    服务端 save 卡顿）。分批之后总耗时略长，但对正在跑服的机器友好得多。
     """
     os.makedirs(os.path.dirname(os.path.abspath(snapshot_path)), exist_ok=True)
     if os.path.exists(snapshot_path):
@@ -179,7 +197,7 @@ def snapshot_database(db_path: str, snapshot_path: str, timeout: float = 60.0) -
     try:
         target = sqlite3.connect(snapshot_path)
         try:
-            source.backup(target)
+            source.backup(target, pages=256, sleep=0.01)
         finally:
             target.close()
     except sqlite3.Error as e:

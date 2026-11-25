@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "pb_files_dir": "./pb_files",
+  "include_pb_config": false,
+  "pb_config_path": "",
+  "temp_dir": "",
+  "cron": "0 2 * * 1",
+  "timezone": "Asia/Shanghai",
+  "openlist_url": "http://127.0.0.1:5244",
+  "openlist_username": "",
+  "openlist_password": "",
+  "openlist_token": "",
+  "remote_dir": "/夸克/Minecraft_Backup",
+  "filename_prefix": "pb_backup_",
+  "max_keep": 4,
+  "min_valid_size_bytes": 8192,
+  "as_task": true,
+  "timeout_sec": 1800,
+  "retry_times": 2,
+  "min_free_space_ratio": 1.15
+}
